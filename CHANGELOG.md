@@ -1,3 +1,6 @@
+# Unreleased (adukilabs fork of 0.24.1)
+  * List a negotiated RED before its primary codec (cherry-picked from #1117, 2c255b4)
+
 # Unreleased
 
 # 0.24.1
