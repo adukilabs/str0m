@@ -179,6 +179,10 @@ pub struct StreamTx {
 
     /// MTU warn threshold; used to cap spurious-padding RTX cache lookups.
     mtu_warn: usize,
+
+    /// Answer NACKs on the main SSRC when the PT has no RTX: the cached packet goes out again
+    /// unchanged (same PT, SSRC and sequence number), as libwebrtc retransmits audio.
+    resend_in_place: bool,
 }
 
 /// RTP packet data to enqueue on a direct RTP send stream.
@@ -334,6 +338,7 @@ impl StreamTx {
             remote_acked_ssrc: false,
             remote_acked_rtx_ssrc: false,
             mtu_warn,
+            resend_in_place: false,
         }
     }
 
@@ -419,6 +424,15 @@ impl StreamTx {
             self.stats.bytes_retransmitted = None;
         }
         self.rtx_ratio_cap = rtx_ratio_cap;
+    }
+
+    /// Answer NACKs for packets whose PT has no RTX by sending them again on the main SSRC with
+    /// their original sequence number, the way libwebrtc retransmits audio (which has no RTX).
+    ///
+    /// Only packets written as [`RtpWrite::nackable`] are cached. RED packets qualify too: the
+    /// resend is the same RED payload under the same PT. Off by default.
+    pub fn set_resend_in_place(&mut self, enabled: bool) {
+        self.resend_in_place = enabled;
     }
 
     /// Set whether this stream is unpaced or not.
@@ -520,6 +534,7 @@ impl StreamTx {
         let ssrc_rtx = self.rtx;
         let remote_acked_ssrc = self.remote_acked_ssrc;
         let remote_acked_rtx_ssrc = self.remote_acked_rtx_ssrc;
+        let resend_in_place = self.resend_in_place;
 
         let (next, is_padding) = if let Some(next) = self.poll_packet_resend(now) {
             (next, false)
@@ -588,6 +603,10 @@ impl StreamTx {
                     // since the above loop figuring out param needs to be correct also
                     // for the NextPacketKind::Blank case.
                     set_pt_for_padding = Some(pt_main);
+                } else if resend_in_place && ssrc_rtx.is_none() {
+                    // No RTX for this PT: a NACK is answered with the same packet on the main
+                    // SSRC (`NextPacketKind::Again`), so the packet stays nackable. RED is fine
+                    // here: the receiver gets the very RED payload it lost.
                 } else {
                     // If the PT we're sending on doesn't have a corresponding RTX PT,
                     // the packet is de-facto not nackable.
@@ -617,6 +636,14 @@ impl StreamTx {
                 header.has_padding = true;
                 header.ssrc = 0.into();
                 header.sequence_number = *next.seq_no as u16;
+                header
+            }
+            NextPacketKind::Again => {
+                // The cached header as it was sent: main PT, SSRC and sequence number.
+                let mut header = header_ref.clone();
+                if !remote_acked_ssrc {
+                    header.ext_vals.mid = Some(mid);
+                }
                 header
             }
             NextPacketKind::Resend(_) | NextPacketKind::Blank(_) => {
@@ -679,7 +706,7 @@ impl StreamTx {
         let pkt = &next.pkt;
 
         let body_len = match next.kind {
-            NextPacketKind::Regular | NextPacketKind::Resend(_) => {
+            NextPacketKind::Regular | NextPacketKind::Resend(_) | NextPacketKind::Again => {
                 let body_len = pkt.payload.len();
                 if let Some(patch) = pkt.vp8_patch.as_ref() {
                     patch.copy_to(pkt.payload.as_ref(), &mut body_out[..body_len]);
@@ -842,9 +869,18 @@ impl StreamTx {
             h.push(now, len);
         }
 
-        let seq_no = self.seq_no_rtx.inc();
-
         let orig_seq_no = pkt.seq_no;
+
+        // Without an RTX SSRC, a packet is cached only for a resend in place (see `set_resend_in_place`).
+        if self.resend_in_place && self.rtx.is_none() {
+            return Some(NextPacket {
+                kind: NextPacketKind::Again,
+                seq_no: orig_seq_no,
+                pkt,
+            });
+        }
+
+        let seq_no = self.seq_no_rtx.inc();
 
         Some(NextPacket {
             kind: NextPacketKind::Resend(orig_seq_no),
@@ -1323,6 +1359,8 @@ struct NextPacket<'a> {
 enum NextPacketKind {
     Regular,
     Resend(SeqNo),
+    /// A NACKed packet sent again as it was, on the main SSRC (no RTX).
+    Again,
     Blank(u8),
 }
 
