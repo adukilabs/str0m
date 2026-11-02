@@ -89,10 +89,9 @@ pub fn audio_resend_in_place() -> Result<(), RtcError> {
             _ => None,
         })
         .collect();
-    let sent = seqs.len();
+    // a lost packet reaches the receiver once, as its resend; the test without the setting shows the loss
     seqs.sort_unstable();
     seqs.dedup();
-    assert!(sent > seqs.len(), "some packets were sent twice");
     assert_eq!(seqs.first(), Some(&10_000));
     assert_eq!(seqs.last(), Some(&(10_000 + num_packets as u16 - 1)));
     assert_eq!(seqs.len(), num_packets, "every lost packet came again");
