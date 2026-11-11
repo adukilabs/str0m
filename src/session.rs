@@ -168,7 +168,8 @@ impl Session {
         let (pacer, bwe) = if let Some(config) = &config.bwe_config {
             let rate = config.initial_bitrate;
             let pacer = PacerImpl::leaky_bucket(rate * 2.0, config.pacer_queue_limit);
-            let bwe = Bwe::new(rate);
+            let mut bwe = Bwe::new(rate);
+            bwe.set_wanted_probes(config.wanted_probes);
             (pacer, Some(bwe))
         } else {
             (PacerImpl::null(), None)
@@ -1187,7 +1188,12 @@ impl Session {
             crate::log_stat!("PACKET_SENT", header.ssrc, payload_size, kind);
         }
 
-        self.pacer.register_send(now, payload_size.into(), midrid);
+        if twcc_enabled {
+            self.pacer.register_send(now, payload_size.into(), midrid);
+        } else {
+            self.pacer
+                .register_send_untracked(now, payload_size.into(), midrid);
+        }
 
         if let Some(raw_packets) = &mut self.raw_packets {
             raw_packets.push_back(Box::new(RawPacket::RtpTx(header.clone(), buf.clone())));

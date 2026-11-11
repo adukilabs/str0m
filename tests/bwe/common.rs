@@ -21,12 +21,22 @@ pub use test_common::*;
 
 /// Helper to create two connected peers with BWE enabled on the sender.
 pub fn connect_with_bwe(initial_bitrate: Bitrate, desired_bitrate: Bitrate) -> (TestRtc, TestRtc) {
+    connect_with_bwe_wanted(initial_bitrate, desired_bitrate, false)
+}
+
+/// As [`connect_with_bwe`], with wanted probes on or off (`RtcConfig::set_bwe_wanted_probes`).
+pub fn connect_with_bwe_wanted(
+    initial_bitrate: Bitrate,
+    desired_bitrate: Bitrate,
+    wanted: bool,
+) -> (TestRtc, TestRtc) {
     let start = Instant::now();
 
     // Only sender (L) needs BWE enabled
     let rtc1 = Rtc::builder()
         .set_rtp_mode(true)
         .enable_bwe(Some(initial_bitrate))
+        .set_bwe_wanted_probes(wanted)
         .build(start);
 
     let rtc2 = Rtc::builder().set_rtp_mode(true).build(start);
@@ -76,6 +86,8 @@ pub struct BweTestContext {
     media_send_rate: Bitrate,
     /// Accumulated byte budget for sending (smooths out timing variations)
     byte_budget: f64,
+    /// Layer rates for an adaptive sender: the highest that fits the estimate is sent (an SFU's layer choice)
+    layers: Option<&'static [Bitrate]>,
 }
 
 type ProbeCheck = Arc<dyn Fn(usize, &ProbeClusterConfig) -> bool>;
@@ -93,6 +105,12 @@ pub enum Step {
         desired_bitrate: Bitrate,
         media_send_rate: Bitrate,
     },
+    /// Send the highest of these layer rates that fits the latest estimate, re-chosen every 100 ms
+    Layers {
+        description: &'static str,
+        desired_bitrate: Bitrate,
+        layers: &'static [Bitrate],
+    },
     /// Run simulation for duration
     Run {
         description: &'static str,
@@ -102,6 +120,11 @@ pub enum Step {
     Check {
         description: &'static str,
         at_least: Bitrate,
+    },
+    /// Check the latest BWE estimate is below a value
+    CheckBelow {
+        description: &'static str,
+        below: Bitrate,
     },
     CheckProbe {
         description: &'static str,
@@ -145,6 +168,7 @@ impl BweTestContext {
             seq_no: 47_000,
             media_send_rate: Bitrate::mbps(2), // Default to 2 Mbps
             byte_budget: 0.0,
+            layers: None,
         }
     }
 
@@ -177,6 +201,18 @@ impl BweTestContext {
                     info!("{}/{}: Media rates: {}", no + 1, total, description);
                     l.bwe().set_desired_bitrate(*desired_bitrate);
                     self.set_media_send_rate(*media_send_rate);
+                    self.layers = None;
+                    event_offset = l.events.len();
+                }
+                Step::Layers {
+                    description,
+                    desired_bitrate,
+                    layers,
+                } => {
+                    info!("{}/{}: Layers: {}", no + 1, total, description);
+                    l.bwe().set_desired_bitrate(*desired_bitrate);
+                    self.layers = Some(layers);
+                    self.media_send_rate = layers[0];
                     event_offset = l.events.len();
                 }
                 Step::Run {
@@ -211,6 +247,24 @@ impl BweTestContext {
                         *at_least
                     );
                     // Check does not reset event offset.
+                }
+                Step::CheckBelow { description, below } => {
+                    let estimate = get_last_bwe_estimate(l).expect("a BWE estimate");
+                    info!(
+                        "{}/{}: Check estimate: {} ({} < {})",
+                        no + 1,
+                        total,
+                        description,
+                        estimate,
+                        *below
+                    );
+                    assert!(
+                        estimate < *below,
+                        "Step {} estimate {} should be below {}",
+                        no + 1,
+                        estimate,
+                        *below
+                    );
                 }
                 Step::CheckProbe { description, check } => {
                     info!("{}/{}: Check probe: {}", no + 1, total, description);
@@ -276,9 +330,30 @@ impl BweTestContext {
         let end_time = start_duration + duration;
 
         let mut last_send_time = l.duration();
+        let mut last_choice = Duration::ZERO;
 
         while l.duration() < end_time {
             let current_time = l.duration();
+
+            if let Some(layers) = self.layers {
+                if current_time >= last_choice + Duration::from_millis(100) {
+                    last_choice = current_time;
+                    let estimate = get_last_bwe_estimate(l).unwrap_or(layers[0]);
+                    let rate = layers
+                        .iter()
+                        .rev()
+                        .find(|&&r| r <= estimate)
+                        .copied()
+                        .unwrap_or(layers[0]);
+                    if rate != self.media_send_rate {
+                        info!(
+                            "{:?} estimate {} layer rate {}",
+                            current_time, estimate, rate
+                        );
+                        self.media_send_rate = rate;
+                    }
+                }
+            }
 
             // Calculate elapsed time since last send
             let elapsed = current_time.saturating_sub(last_send_time);

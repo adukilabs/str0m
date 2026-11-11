@@ -141,6 +141,15 @@ impl Pacer for LeakyBucketPacer {
     }
 
     fn register_send(&mut self, now: Instant, packet_size: DataSize, _from: MidRid) {
+        self.register(now, packet_size, true);
+    }
+}
+
+impl LeakyBucketPacer {
+    /// A packet sent. Only a packet the remote reports in TWCC feedback (`tracked`) counts towards
+    /// the active probe cluster: the probe estimator sees only those, so a cluster completed with
+    /// untracked packets (audio on an m-line without TWCC) is too small to give a result.
+    pub(crate) fn register(&mut self, now: Instant, packet_size: DataSize, tracked: bool) {
         self.last_emitted = Some(now);
 
         self.media_debt += packet_size;
@@ -152,7 +161,7 @@ impl Pacer for LeakyBucketPacer {
 
         // Update active probe state to track this packet
         // This ensures probe timing advances correctly even when sending media packets
-        if let Some(probe) = self.probe_queue.front_mut() {
+        if let Some(probe) = self.probe_queue.front_mut().filter(|_| tracked) {
             probe.record_packet(now, packet_size);
         }
 
@@ -526,6 +535,31 @@ mod test {
                 .handle_timeout(deadline, std::iter::once(queue))
                 .is_some()
         );
+    }
+
+    #[test]
+    fn untracked_sends_do_not_complete_a_probe() {
+        use crate::bwe_::ProbeKind;
+
+        let now = Instant::now();
+        let mut pacer = LeakyBucketPacer::new(Bitrate::kbps(300));
+        pacer.start_probe(ProbeClusterConfig::new(
+            0.into(),
+            Bitrate::kbps(300),
+            ProbeKind::Initial,
+        ));
+
+        // Audio on an m-line without TWCC: the probe estimator never sees these.
+        for i in 0..10 {
+            pacer.register(now + Duration::from_millis(i), DataSize::bytes(200), false);
+        }
+        assert!(pacer.check_probe_complete(now).is_none());
+
+        // Five tracked packets of the cluster's bytes complete it.
+        for i in 0..5 {
+            pacer.register(now + Duration::from_millis(i), DataSize::bytes(200), true);
+        }
+        assert_eq!(pacer.check_probe_complete(now), Some(0.into()));
     }
 
     #[test]

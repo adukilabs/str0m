@@ -57,6 +57,15 @@ impl PacerImpl {
             PacerImpl::LeakyBucket(v) => v.check_probe_complete(now),
         }
     }
+
+    /// As [`Pacer::register_send`], for a packet without a transport-wide sequence number
+    /// (TWCC not negotiated on its m-line): it does not count towards an active probe cluster.
+    pub fn register_send_untracked(&mut self, now: Instant, packet_size: DataSize, from: MidRid) {
+        match self {
+            PacerImpl::Null(v) => v.register_send(now, packet_size, from),
+            PacerImpl::LeakyBucket(v) => v.register(now, packet_size, false),
+        }
+    }
 }
 
 impl Pacer for PacerImpl {

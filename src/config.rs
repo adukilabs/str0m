@@ -65,6 +65,8 @@ pub(crate) struct BweConfig {
     pub(crate) initial_bitrate: Bitrate,
     /// The longest the average packet may wait in the pacer before the queue is drained faster.
     pub(crate) pacer_queue_limit: Option<Duration>,
+    /// Probe toward an unmet desired bitrate in any ALR or loss state.
+    pub(crate) wanted_probes: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -493,6 +495,22 @@ impl RtcConfig {
         self
     }
 
+    /// Probe toward an unmet desired bitrate whatever the ALR and loss state (default off, as WebRTC). Only relevant
+    /// with the BWE on ([`Self::enable_bwe()`], call that first).
+    ///
+    /// A sender that follows the estimate (an SFU choosing layers per receiver) drops to a low layer when the link dips.
+    /// Once the link is back, the estimate may only grow to about 1.5x what that layer sends, too little to be
+    /// application limited and, after losses, in a state where WebRTC's probe kinds do not fire: the receiver stays on
+    /// the low layer for good. With this on, a short probe at twice the estimate goes out while the desired bitrate
+    /// ([`crate::bwe::Bwe::set_desired_bitrate()`]) is above the estimate and the delay detector sees no overuse: at
+    /// once after a probe that raised the estimate, else after 1 s, doubling to at most 3 s.
+    pub fn set_bwe_wanted_probes(mut self, enabled: bool) -> Self {
+        if let Some(conf) = self.bwe_config.as_mut() {
+            conf.wanted_probes = enabled;
+        }
+        self
+    }
+
     /// The initial bitrate as set by [`Self::enable_bwe()`].
     ///
     /// ```
@@ -880,6 +898,7 @@ impl BweConfig {
         Self {
             initial_bitrate,
             pacer_queue_limit: None,
+            wanted_probes: false,
         }
     }
 }

@@ -43,6 +43,13 @@ const ESTIMATE_CHANGE_THRESHOLD: f64 = 0.05;
 /// Probe rate scale for stagnation probes (2× current estimate).
 const STAGNANT_PROBE_SCALE: f64 = 2.0;
 
+/// Shortest and longest wait between wanted probes that did not raise the estimate.
+const MIN_TIME_BETWEEN_WANTED_PROBES: Duration = Duration::from_secs(1);
+const MAX_TIME_BETWEEN_WANTED_PROBES: Duration = Duration::from_secs(3);
+
+/// Probe rate scale for wanted probes (2× current estimate, capped at 2× desired).
+const WANTED_PROBE_SCALE: f64 = 2.0;
+
 /// WebRTC's `BandwidthLimitedCause` (subset used by probing gating).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BandwidthLimitedCause {
@@ -74,6 +81,9 @@ pub struct ProbeControl {
     large_drop: Option<LargeDrop>,
 
     last_stagnant: Option<Instant>,
+
+    wanted: bool,
+    wanted_wait: Duration,
 
     next_cluster_id: TwccClusterId,
     pending: VecDeque<ProbeClusterConfig>,
@@ -114,6 +124,8 @@ impl Default for ProbeControl {
             last_probe: None,
             large_drop: None,
             last_stagnant: None,
+            wanted: false,
+            wanted_wait: MIN_TIME_BETWEEN_WANTED_PROBES,
             pending: VecDeque::new(),
             scheduled_exponential: None,
             scheduled_periodic_alr: None,
@@ -138,6 +150,7 @@ impl ProbeControl {
             self.desired_bitrate = None;
             self.last_estimate_change = None;
             self.last_stagnant = None;
+            self.wanted_wait = MIN_TIME_BETWEEN_WANTED_PROBES;
             self.last_probe = None;
             self.prev_estimate = None;
             self.scheduled_exponential = None;
@@ -145,6 +158,15 @@ impl ProbeControl {
             self.scheduled_stagnant = None;
             self.next_timeout = not_happening();
         }
+    }
+
+    /// Turn wanted probes on or off (see `maybe_wanted`).
+    pub fn set_wanted(&mut self, v: bool) {
+        self.wanted = v;
+    }
+
+    pub fn wanted(&self) -> bool {
+        self.wanted
     }
 
     pub fn set_desired_bitrate(&mut self, v: Bitrate) {
@@ -233,18 +255,21 @@ impl ProbeControl {
             return Some(config);
         }
 
-        // Can't probe in certain bandwidth-limited states.
-        if !self.can_probe(estimate) {
+        // Infinite estimate indicates no valid measurement yet.
+        if estimate == Bitrate::INFINITY {
             return None;
         }
 
-        // Try each probe type in order - only one fires per timeout.
-        let _ = self.maybe_initial(now, desired, estimate)
-            || self.maybe_exponential(now, desired, estimate)
-            || self.maybe_increase_alr(now, desired, estimate)
-            || self.maybe_large_drop(now, desired, estimate)
-            || self.maybe_periodic_alr(now, desired)
-            || self.maybe_stagnant(now, desired, estimate);
+        // Try each probe type in order - only one fires per timeout. The WebRTC kinds can't
+        // probe in certain bandwidth-limited states; a wanted probe can (see `maybe_wanted`).
+        let _ = (self.can_probe(estimate)
+            && (self.maybe_initial(now, desired, estimate)
+                || self.maybe_exponential(now, desired, estimate)
+                || self.maybe_increase_alr(now, desired, estimate)
+                || self.maybe_large_drop(now, desired, estimate)
+                || self.maybe_periodic_alr(now, desired)
+                || self.maybe_stagnant(now, desired, estimate)))
+            || self.maybe_wanted(now, desired, estimate);
 
         self.update_estimate_change(now, estimate);
 
@@ -479,6 +504,74 @@ impl ProbeControl {
         true
     }
 
+    /// Probe toward an unmet desired bitrate, whatever the ALR and loss state.
+    ///
+    /// ## Why This Exists (str0m Addition)
+    ///
+    /// A sender that follows the estimate (an SFU choosing simulcast or temporal layers per
+    /// receiver) drops to a low layer when the link dips. Once the link is back nothing raises
+    /// the estimate again:
+    ///
+    /// 1. The delay controller's AIMD and the loss controller cap an increase at about 1.5× the
+    ///    acked rate, which is the low layer's rate.
+    /// 2. Sending the low layer can use more than 20% of the estimate, so ALR never starts and
+    ///    neither periodic ALR nor large-drop probes fire.
+    /// 3. Losses during the dip leave the loss controller decreasing, and `can_probe` refuses
+    ///    every WebRTC probe kind (and the stagnant probe) in that state.
+    ///
+    /// The receiver then stays on the lowest layer for good. When turned on
+    /// (`RtcConfig::set_bwe_wanted_probes`, off by default as in WebRTC), a wanted probe fires while the
+    /// desired bitrate is above the estimate and the delay detector does not see overuse.
+    /// It probes at 2× the estimate; a probe that raised the estimate (at least 70% of the probe
+    /// rate) is followed at once by the next, so the estimate climbs in a few round trips. A probe
+    /// that did not waits 1 s, doubling to at most 3 s, before the next one. Probes are short
+    /// (15 ms), so on a link that really is full this costs a brief queue every few seconds.
+    fn maybe_wanted(&mut self, now: Instant, desired: Bitrate, estimate: Bitrate) -> bool {
+        // Off unless asked for (`RtcConfig::set_bwe_wanted_probes`).
+        if !self.wanted {
+            return false;
+        }
+
+        // Don't interfere with initial probing phase.
+        if self.is_during_initial(now) {
+            return false;
+        }
+
+        // Never while the delay detector signals overuse.
+        if self.last_cause == BandwidthLimitedCause::DelayBasedLimitedDelayIncreased {
+            return false;
+        }
+
+        // Only if there's unmet demand.
+        if desired <= estimate * (1.0 + ESTIMATE_CHANGE_THRESHOLD) {
+            self.wanted_wait = MIN_TIME_BETWEEN_WANTED_PROBES;
+            return false;
+        }
+
+        let since = self.time_since_last_probe(now);
+        if let Some(last) = self.last_probe.filter(|p| p.kind == ProbeKind::Wanted) {
+            if estimate >= last.further && Some(estimate) != last.was_estimate {
+                // The last wanted probe raised the estimate: go on climbing.
+                self.wanted_wait = MIN_TIME_BETWEEN_WANTED_PROBES;
+            } else if since < self.wanted_wait {
+                return false;
+            } else {
+                // It did not: wait longer before the next one.
+                self.wanted_wait = (self.wanted_wait * 2).min(MAX_TIME_BETWEEN_WANTED_PROBES);
+            }
+        } else if since < self.wanted_wait {
+            return false;
+        }
+
+        self.queue_probe(
+            estimate * WANTED_PROBE_SCALE,
+            ProbeKind::Wanted,
+            desired,
+            now,
+        );
+        true
+    }
+
     fn maybe_large_drop(&mut self, now: Instant, desired: Bitrate, estimate: Bitrate) -> bool {
         // Don't interfere with initial probing phase.
         if self.is_during_initial(now) {
@@ -556,6 +649,26 @@ impl ProbeControl {
     }
 
     fn compute_next_timeout(&mut self, now: Instant) -> Instant {
+        let next = self.compute_next_kind_timeout(now);
+
+        // Wanted probing: retry while the desired bitrate is above the estimate.
+        let unmet = self.wanted
+            && match (self.desired_bitrate, self.last_estimate) {
+                (Some(d), Some(e)) => d > e * (1.0 + ESTIMATE_CHANGE_THRESHOLD),
+                _ => false,
+            };
+        if !unmet {
+            return next;
+        }
+        let at = self
+            .last_when()
+            .map(|t| t + self.wanted_wait)
+            .unwrap_or(now + self.wanted_wait)
+            .max(now);
+        next.min(at)
+    }
+
+    fn compute_next_kind_timeout(&mut self, now: Instant) -> Instant {
         // Exponential probing: wait for probe result before re-probing at same estimate.
         // This handles the case where we sent a probe but haven't received updated estimate yet.
         if let Some(last) = &self.last_probe {
@@ -996,5 +1109,96 @@ mod test {
             probe.is_some(),
             "Should continue periodic probing in ALR even when estimate >= max_bitrate"
         );
+    }
+
+    /// Past the initial probes, the estimate dipped to 60 kb/s with the loss controller
+    /// decreasing: no WebRTC probe kind may fire then.
+    fn after_dip(wanted: bool) -> (ProbeControl, Instant) {
+        let mut pc = ProbeControl::new();
+        pc.set_wanted(wanted);
+        pc.enable(true);
+        let now = Instant::now();
+
+        pc.set_desired_bitrate(Bitrate::kbps(1_500));
+        pc.set_estimated_bitrate(Bitrate::kbps(300), BandwidthLimitedCause::DelayBasedLimited);
+        let _ = pc.handle_timeout(now);
+        let _ = pc.handle_timeout(now);
+
+        pc.set_estimated_bitrate(Bitrate::kbps(60), BandwidthLimitedCause::LossLimitedBwe);
+        (pc, now + Duration::from_secs(10))
+    }
+
+    #[test]
+    fn no_probe_after_dip_without_wanted_probes() {
+        let (mut pc, at) = after_dip(false);
+        for s in 0..30 {
+            assert!(pc.handle_timeout(at + Duration::from_secs(s)).is_none());
+        }
+    }
+
+    #[test]
+    fn wanted_probe_after_dip_while_loss_limited() {
+        let (mut pc, at) = after_dip(true);
+
+        let p = pc.handle_timeout(at).expect("a wanted probe");
+        assert_eq!(p.target_bitrate(), Bitrate::kbps(120));
+        assert!(!p.is_alr_probe());
+    }
+
+    #[test]
+    fn wanted_probes_climb_while_they_raise_the_estimate() {
+        let (mut pc, at) = after_dip(true);
+        assert!(pc.handle_timeout(at).is_some());
+
+        // The probe raised the estimate (above 70% of 120 kb/s): the next goes at once.
+        let at = at + Duration::from_millis(100);
+        pc.set_estimated_bitrate(Bitrate::kbps(115), BandwidthLimitedCause::LossLimitedBwe);
+        let p = pc.handle_timeout(at).expect("the next wanted probe");
+        assert_eq!(p.target_bitrate(), Bitrate::kbps(230));
+
+        pc.set_estimated_bitrate(Bitrate::kbps(220), BandwidthLimitedCause::DelayBasedLimited);
+        let p = pc
+            .handle_timeout(at + Duration::from_millis(100))
+            .expect("and the next");
+        assert_eq!(p.target_bitrate(), Bitrate::kbps(440));
+    }
+
+    #[test]
+    fn wanted_probes_back_off_when_the_estimate_stays() {
+        let (mut pc, at) = after_dip(true);
+        assert!(pc.handle_timeout(at).is_some());
+        assert!(pc.poll_timeout() <= at + Duration::from_secs(1));
+
+        // 1 s, then 2 s, then at most 3 s between probes that change nothing.
+        assert!(pc.handle_timeout(at + Duration::from_millis(900)).is_none());
+        assert!(pc.handle_timeout(at + Duration::from_secs(1)).is_some());
+        assert!(
+            pc.handle_timeout(at + Duration::from_millis(2_900))
+                .is_none()
+        );
+        assert!(pc.handle_timeout(at + Duration::from_secs(3)).is_some());
+        assert!(
+            pc.handle_timeout(at + Duration::from_millis(5_900))
+                .is_none()
+        );
+        assert!(pc.handle_timeout(at + Duration::from_secs(6)).is_some());
+        assert!(
+            pc.handle_timeout(at + Duration::from_millis(8_900))
+                .is_none()
+        );
+        assert!(pc.handle_timeout(at + Duration::from_secs(9)).is_some());
+    }
+
+    #[test]
+    fn no_wanted_probe_under_overuse_or_without_demand() {
+        let (mut pc, at) = after_dip(true);
+        pc.set_estimated_bitrate(
+            Bitrate::kbps(60),
+            BandwidthLimitedCause::DelayBasedLimitedDelayIncreased,
+        );
+        assert!(pc.handle_timeout(at).is_none());
+
+        pc.set_estimated_bitrate(Bitrate::kbps(1_500), BandwidthLimitedCause::LossLimitedBwe);
+        assert!(pc.handle_timeout(at + Duration::from_secs(5)).is_none());
     }
 }

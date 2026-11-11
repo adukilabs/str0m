@@ -50,6 +50,7 @@ pub enum ProbeKind {
     PeriodicAlr,
     LargeDrop,
     Stagnant,
+    Wanted,
 }
 
 impl ProbeKind {

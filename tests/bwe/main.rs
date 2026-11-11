@@ -7,6 +7,7 @@ mod common;
 mod alr;
 mod changing;
 mod delay;
+mod dip;
 mod estimate;
 mod loss;
 mod probes;

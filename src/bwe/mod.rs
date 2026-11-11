@@ -91,6 +91,11 @@ impl Bwe {
         self.bwe.reset(init_bitrate);
     }
 
+    /// Probe toward an unmet desired bitrate in any ALR or loss state (`RtcConfig::set_bwe_wanted_probes`).
+    pub fn set_wanted_probes(&mut self, enabled: bool) {
+        self.bwe.probe_control.set_wanted(enabled);
+    }
+
     pub fn update<'t>(
         &mut self,
         records: impl Iterator<Item = &'t crate::rtp_::TwccSendRecord>,
@@ -410,7 +415,9 @@ impl SendSideBandwidthEstimator {
     }
 
     pub fn reset(&mut self, init_bitrate: Bitrate) {
+        let wanted = self.probe_control.wanted();
         *self = Self::new(init_bitrate);
+        self.probe_control.set_wanted(wanted);
     }
 }
 
