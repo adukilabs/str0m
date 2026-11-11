@@ -1007,7 +1007,12 @@ mod test {
     /// pacer wants to be polled again.
     /// When the last of `count` packets of `size` bytes, queued at once, leaves a pacer at `bitrate` (1 ms ticks, up
     /// to 3 s).
-    fn drained_by(bitrate: Bitrate, limit: Option<Duration>, size: usize, count: u16) -> Option<Duration> {
+    fn drained_by(
+        bitrate: Bitrate,
+        limit: Option<Duration>,
+        size: usize,
+        count: u16,
+    ) -> Option<Duration> {
         let now = Instant::now();
         let mut queue = Queue::default();
         let mut pacer = LeakyBucketPacer::new(bitrate);
@@ -1042,9 +1047,13 @@ mod test {
     fn test_queue_limit_drains_a_large_frame() {
         // a 24 kB frame at a 100 kb/s pacing rate: about 2 s paced, well within 0.5 s with a 100 ms queue limit
         let paced = drained_by(Bitrate::kbps(100), None, 1200, 20);
-        let short = drained_by(Bitrate::kbps(100), Some(duration_ms(100)), 1200, 20).expect("drained");
+        let short =
+            drained_by(Bitrate::kbps(100), Some(duration_ms(100)), 1200, 20).expect("drained");
         assert!(short < duration_ms(500), "drained in {short:?}");
-        assert!(paced.is_none_or(|p| p > duration_ms(1000)), "default limit drained in {paced:?}");
+        assert!(
+            paced.is_none_or(|p| p > duration_ms(1000)),
+            "default limit drained in {paced:?}"
+        );
     }
 
     fn measure_burst(bitrate: Bitrate, size: usize, count: u16) -> (DataSize, Duration) {
