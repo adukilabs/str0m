@@ -63,6 +63,8 @@ pub struct RtcConfig {
 #[derive(Debug, Clone)]
 pub(crate) struct BweConfig {
     pub(crate) initial_bitrate: Bitrate,
+    /// The longest the average packet may wait in the pacer before the queue is drained faster.
+    pub(crate) pacer_queue_limit: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -479,6 +481,18 @@ impl RtcConfig {
         self
     }
 
+    /// Sets the longest the average packet may wait in the pacer before it drains the queue faster than the estimate
+    /// (default 2 s). Only relevant with the BWE on ([`Self::enable_bwe()`], call that first).
+    ///
+    /// An SFU forwards frames it did not encode, so a low estimate cannot make them smaller: with a long limit a large
+    /// frame waits seconds behind an estimate that dipped; a short one keeps the pacer a smoother.
+    pub fn set_pacer_queue_limit(mut self, limit: Duration) -> Self {
+        if let Some(conf) = self.bwe_config.as_mut() {
+            conf.pacer_queue_limit = Some(limit);
+        }
+        self
+    }
+
     /// The initial bitrate as set by [`Self::enable_bwe()`].
     ///
     /// ```
@@ -863,7 +877,10 @@ impl RtcConfig {
 
 impl BweConfig {
     fn new(initial_bitrate: Bitrate) -> Self {
-        Self { initial_bitrate }
+        Self {
+            initial_bitrate,
+            pacer_queue_limit: None,
+        }
     }
 }
 

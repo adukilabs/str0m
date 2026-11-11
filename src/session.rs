@@ -167,7 +167,7 @@ impl Session {
         }
         let (pacer, bwe) = if let Some(config) = &config.bwe_config {
             let rate = config.initial_bitrate;
-            let pacer = PacerImpl::leaky_bucket(rate * 2.0);
+            let pacer = PacerImpl::leaky_bucket(rate * 2.0, config.pacer_queue_limit);
             let bwe = Bwe::new(rate);
             (pacer, Some(bwe))
         } else {

@@ -185,6 +185,11 @@ impl LeakyBucketPacer {
         }
     }
 
+    /// Sets the longest the average packet may wait before the queue is drained faster than the pacing rate.
+    pub(crate) fn set_queue_limit(&mut self, limit: Duration) {
+        self.queue_limit = limit;
+    }
+
     /// Start executing a probe cluster.
     ///
     /// The pacer will pace at the probe's target bitrate and track packets sent.
@@ -1000,6 +1005,48 @@ mod test {
     ///
     /// Returns the number of bytes released in that burst and how long after the burst the
     /// pacer wants to be polled again.
+    /// When the last of `count` packets of `size` bytes, queued at once, leaves a pacer at `bitrate` (1 ms ticks, up
+    /// to 3 s).
+    fn drained_by(bitrate: Bitrate, limit: Option<Duration>, size: usize, count: u16) -> Option<Duration> {
+        let now = Instant::now();
+        let mut queue = Queue::default();
+        let mut pacer = LeakyBucketPacer::new(bitrate);
+        if let Some(limit) = limit {
+            pacer.set_queue_limit(limit);
+        }
+        handle_timeout_noisy(&mut pacer, &mut queue, now);
+        for seq_no in 0..count {
+            enqueue_packet_noisy(&mut pacer, &mut queue, seq_no, size, PacketKind::Video, now);
+        }
+        let mut sent = 0;
+        for ms in 0..3000 {
+            let at = now + duration_ms(ms);
+            handle_timeout_noisy(&mut pacer, &mut queue, at);
+            while let Some((qid, _)) = pacer.poll_queue() {
+                let Some(packet) = queue.next_packet() else {
+                    break;
+                };
+                pacer.register_send(at, DataSize::from(packet.size()), qid);
+                queue.register_send(qid, at);
+                handle_timeout_noisy(&mut pacer, &mut queue, at);
+                sent += 1;
+                if sent == count {
+                    return Some(duration_ms(ms));
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn test_queue_limit_drains_a_large_frame() {
+        // a 24 kB frame at a 100 kb/s pacing rate: about 2 s paced, well within 0.5 s with a 100 ms queue limit
+        let paced = drained_by(Bitrate::kbps(100), None, 1200, 20);
+        let short = drained_by(Bitrate::kbps(100), Some(duration_ms(100)), 1200, 20).expect("drained");
+        assert!(short < duration_ms(500), "drained in {short:?}");
+        assert!(paced.is_none_or(|p| p > duration_ms(1000)), "default limit drained in {paced:?}");
+    }
+
     fn measure_burst(bitrate: Bitrate, size: usize, count: u16) -> (DataSize, Duration) {
         let now = Instant::now();
         let mut queue = Queue::default();
