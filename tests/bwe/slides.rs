@@ -76,6 +76,7 @@ fn slides(
     every: Duration,
     run: Duration,
     settle: Duration,
+    step: Option<(Duration, Bitrate)>,
 ) -> Result<Outcome, RtcError> {
     let start = Instant::now();
     let rtc1 = Rtc::builder()
@@ -147,8 +148,13 @@ fn slides(
         *seq += 1;
     };
 
+    let mut step = step;
     while l.duration() < began + run {
         let now = l.duration();
+        if let Some((_, to)) = step.filter(|(at, _)| now >= began + *at) {
+            r.set_netem(link(to, Duration::from_millis(300)));
+            step = None;
+        }
         budget += idle.as_f64() / 8.0 * now.saturating_sub(last).as_secs_f64();
         last = now;
         while budget >= PACKET as f64 {
@@ -268,6 +274,7 @@ pub fn slide_changes_keep_the_estimate() -> Result<(), RtcError> {
         Duration::from_secs(3),
         Duration::from_secs(30),
         Duration::from_secs(5),
+        None,
     )?;
     report("2mbps", SFU, &o);
     assert!(
@@ -297,6 +304,7 @@ pub fn keyframes_through_a_narrow_link() -> Result<(), RtcError> {
         Duration::from_secs(6),
         Duration::from_secs(30),
         Duration::from_secs(5),
+        None,
     )?;
     report("500kbps", SFU, &o);
     let worst = o.worst().expect("every keyframe arrives");
@@ -336,12 +344,41 @@ pub fn slides_compare() -> Result<(), RtcError> {
                             every,
                             Duration::from_secs(30),
                             Duration::from_secs(5),
+                            None,
                         )?;
                         report(name, s, &o);
                     }
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// A step from 2 Mb/s down to 500 kb/s (L2's dip) with a 1080p keyframe every 6 s: the estimate falls below the link
+/// for a while, so the drain decides whether the keyframes overflow the link's queue (run with `--ignored
+/// --nocapture`).
+#[test]
+#[ignore]
+pub fn step_compare() -> Result<(), RtcError> {
+    init_log();
+    init_crypto_default();
+    for drain in [1_000, 2_000, 4_000, 6_000] {
+        let s = Settings {
+            drain: Duration::from_millis(drain),
+            ..SFU
+        };
+        let o = slides(
+            s,
+            Bitrate::mbps(2),
+            Bitrate::kbps(60),
+            100_000,
+            Duration::from_secs(6),
+            Duration::from_secs(40),
+            Duration::from_secs(12),
+            Some((Duration::from_secs(10), Bitrate::kbps(500))),
+        )?;
+        report("step", s, &o);
     }
     Ok(())
 }
