@@ -46,6 +46,7 @@ pub(crate) use macros::{log_pacer_media_debt, log_pacer_padding_debt};
 pub(crate) use probe::ProbeKind;
 pub(crate) use probe::{BandwidthLimitedCause, ProbeEstimator};
 pub(crate) use probe::{ProbeClusterState, ProbeControl};
+pub(crate) use smoother::ESTIMATE_WINDOW;
 
 #[cfg(feature = "_internal_test_exports")]
 pub use probe::ProbeClusterConfig;
@@ -102,6 +103,16 @@ impl Bwe {
         self.bwe.delivery = enabled.then(DeliveryRate::default);
     }
 
+    /// A loss-based estimate too goes no lower than 0.85x the delivery rate (`RtcConfig::set_bwe_loss_floor`).
+    pub fn set_loss_floor(&mut self, enabled: bool) {
+        self.bwe.loss_floor = enabled;
+    }
+
+    /// The window the emitted estimate is averaged over (`RtcConfig::set_bwe_estimate_window`).
+    pub fn set_estimate_window(&mut self, window: Duration) {
+        self.smoother.set_window(window);
+    }
+
     pub fn update<'t>(
         &mut self,
         records: impl Iterator<Item = &'t crate::rtp_::TwccSendRecord>,
@@ -150,6 +161,10 @@ struct SendSideBandwidthEstimator {
     last_updated_estimate: Option<Bitrate>,
     /// The receiver's delivery rate, when a delay-based decrease is floored by it.
     delivery: Option<DeliveryRate>,
+    /// A loss-limited estimate goes no lower than 0.85x the delivery rate (needs `delivery`).
+    loss_floor: bool,
+    /// The delivery rate as of the last update or timeout (`loss_floor`).
+    delivered: Option<Bitrate>,
 }
 
 impl SendSideBandwidthEstimator {
@@ -174,6 +189,8 @@ impl SendSideBandwidthEstimator {
             link_capacity_estimator: LinkCapacityEstimator::new(),
             last_updated_estimate: None,
             delivery: None,
+            loss_floor: false,
+            delivered: None,
         }
     }
 
@@ -231,7 +248,8 @@ impl SendSideBandwidthEstimator {
 
         if let Some(delivery) = self.delivery.as_mut() {
             delivery.update(&acked_packets, now);
-            self.delay_controller.set_delivered(delivery.rate(now));
+            self.delivered = delivery.rate(now);
+            self.delay_controller.set_delivered(self.delivered);
         }
 
         for acked_packet in acked_packets.iter() {
@@ -312,7 +330,8 @@ impl SendSideBandwidthEstimator {
         now: Instant,
     ) -> Option<ProbeClusterConfig> {
         if let Some(delivery) = self.delivery.as_ref() {
-            self.delay_controller.set_delivered(delivery.rate(now));
+            self.delivered = delivery.rate(now);
+            self.delay_controller.set_delivered(self.delivered);
         }
         self.delay_controller
             .handle_timeout(self.acked_bitrate_estimator.current_estimate(), now);
@@ -402,8 +421,18 @@ impl SendSideBandwidthEstimator {
                 delay_estimate
             }
             LossControllerState::Decreasing | LossControllerState::Increasing => {
+                // a burst lost at a full queue arrived at the link's rate: keep 0.85x that, as a delay-based
+                // decrease does (`RtcConfig::set_bwe_loss_floor`)
+                let floor = self
+                    .delivered
+                    .filter(|_| self.loss_floor && self.delivery.is_some())
+                    .map(|d| d * LOSS_FLOOR);
+                let loss_estimate = match (loss_result.bandwidth_estimate, floor) {
+                    (Some(le), Some(f)) => Some(le.max(f)),
+                    (le, _) => le,
+                };
                 // Loss controller is actively limiting or recovering
-                match (delay_estimate, loss_result.bandwidth_estimate) {
+                match (delay_estimate, loss_estimate) {
                     (Some(de), Some(le)) => Some(de.min(le)),
                     (None, le @ Some(_)) => le,
                     (de @ Some(_), None) => de,
@@ -516,6 +545,10 @@ impl fmt::Display for BandwidthUsage {
         }
     }
 }
+
+/// A loss-limited estimate keeps this much of the delivery rate (`RtcConfig::set_bwe_loss_floor`), as a delay-based
+/// decrease does (its beta).
+const LOSS_FLOOR: f64 = 0.85;
 
 /// Packets received over this long (remote clock) make a delivery rate.
 const DELIVERY_WINDOW: Duration = Duration::from_millis(250);

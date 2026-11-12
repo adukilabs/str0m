@@ -69,6 +69,10 @@ pub(crate) struct BweConfig {
     pub(crate) wanted_probes: bool,
     /// A delay-based decrease goes no lower than 0.85x the rate the receiver got packets at lately.
     pub(crate) delivery_floor: bool,
+    /// A loss-based estimate too goes no lower than 0.85x that delivery rate.
+    pub(crate) loss_floor: bool,
+    /// The window the emitted estimate is averaged over.
+    pub(crate) estimate_window: Duration,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -529,6 +533,28 @@ impl RtcConfig {
         self
     }
 
+    /// A loss-limited estimate goes no lower than 0.85x the rate the receiver got packets at lately, as a delay-based
+    /// decrease with [`Self::set_bwe_delivery_floor()`] (default off; needs that on too).
+    ///
+    /// A sender of bursts that meets a narrower link (a step down) loses the tail of the burst at the bottleneck's full
+    /// queue; the loss-based estimate then falls toward the acknowledged bitrate, which for a bursty sender is its idle
+    /// rate, a fraction of the link. The packets that did arrive came at the link's rate: that is what this keeps.
+    pub fn set_bwe_loss_floor(mut self, enabled: bool) -> Self {
+        if let Some(conf) = self.bwe_config.as_mut() {
+            conf.loss_floor = enabled;
+        }
+        self
+    }
+
+    /// The window over which the estimate in [`crate::Event::EgressBitrateEstimate`] is averaged (default 3 s).
+    /// Shorter follows the link sooner, both down and back up; the pacer always uses the unaveraged estimate.
+    pub fn set_bwe_estimate_window(mut self, window: Duration) -> Self {
+        if let Some(conf) = self.bwe_config.as_mut() {
+            conf.estimate_window = window;
+        }
+        self
+    }
+
     /// The initial bitrate as set by [`Self::enable_bwe()`].
     ///
     /// ```
@@ -918,6 +944,8 @@ impl BweConfig {
             pacer_queue_limit: None,
             wanted_probes: false,
             delivery_floor: false,
+            loss_floor: false,
+            estimate_window: crate::bwe_::ESTIMATE_WINDOW,
         }
     }
 }

@@ -40,6 +40,10 @@ struct Settings {
     wanted: bool,
     /// The RTX ratio cap of the send stream (aduki voice: 0.3 for video)
     ratio: Option<f32>,
+    /// `RtcConfig::set_bwe_loss_floor`
+    loss: bool,
+    /// `RtcConfig::set_bwe_estimate_window`
+    window: Duration,
 }
 
 #[derive(Debug)]
@@ -85,6 +89,8 @@ fn slides(
         .set_pacer_queue_limit(settings.drain)
         .set_bwe_wanted_probes(settings.wanted)
         .set_bwe_delivery_floor(settings.floor)
+        .set_bwe_loss_floor(settings.loss)
+        .set_bwe_estimate_window(settings.window)
         .build(start);
     let rtc2 = Rtc::builder()
         .set_rtp_mode(true)
@@ -236,9 +242,11 @@ fn report(name: &str, settings: Settings, o: &Outcome) {
         .map(|t| t.map_or("lost".into(), |t| format!("{}", t.as_millis())))
         .collect();
     println!(
-        "slides: {name} drain={}ms floor={} wanted={} ratio={:?} lowest={} mean={} median={:?} worst={:?} frames_ms=[{}] missing={:?}",
+        "slides: {name} drain={}ms floor={} loss={} window={}ms wanted={} ratio={:?} lowest={} mean={} median={:?} worst={:?} frames_ms=[{}] missing={:?}",
         settings.drain.as_millis(),
         settings.floor,
+        settings.loss,
+        settings.window.as_millis(),
         settings.wanted,
         settings.ratio,
         o.lowest,
@@ -258,6 +266,15 @@ const SFU: Settings = Settings {
     floor: true,
     wanted: true,
     ratio: None,
+    loss: true,
+    window: Duration::from_secs(1),
+};
+
+/// pace2's settings: no loss floor, str0m's 3 s estimate window.
+const PACE2: Settings = Settings {
+    loss: false,
+    window: Duration::from_secs(3),
+    ..SFU
 };
 
 /// Slide changes (100 kB) every 3 s on a 2 Mb/s link with a 300 ms queue: the estimate holds and every slide arrives
@@ -328,6 +345,7 @@ pub fn slides_compare() -> Result<(), RtcError> {
                         floor,
                         wanted,
                         ratio,
+                        ..PACE2
                     };
                     for (name, rate, every) in [
                         ("2mbps", Bitrate::mbps(2), Duration::from_secs(3)),
@@ -366,7 +384,7 @@ pub fn step_compare() -> Result<(), RtcError> {
     for drain in [1_000, 2_000, 4_000, 6_000] {
         let s = Settings {
             drain: Duration::from_millis(drain),
-            ..SFU
+            ..PACE2
         };
         let o = slides(
             s,
@@ -379,6 +397,65 @@ pub fn step_compare() -> Result<(), RtcError> {
             Some((Duration::from_secs(10), Bitrate::kbps(500))),
         )?;
         report("step", s, &o);
+    }
+    Ok(())
+}
+
+/// L2's dip: 2 Mb/s, then 500 kb/s from 10 s, a 1080p keyframe every 6 s. The step loses the tail of whatever was in
+/// flight; without the loss floor the loss-based estimate fell further toward the idle rate (the browser run saw
+/// 171 kb/s), and more of each keyframe was lost. With it the estimate keeps most of the new link.
+#[test]
+pub fn a_step_down_keeps_the_new_link() -> Result<(), RtcError> {
+    init_log();
+    init_crypto_default();
+    let o = step(SFU)?;
+    report("step", SFU, &o);
+    let before = step(PACE2)?;
+    report("step", PACE2, &before);
+    assert!(
+        o.lowest >= Bitrate::kbps(300) && o.lowest > before.lowest,
+        "estimate fell to {} (without the floor {})",
+        o.lowest,
+        before.lowest
+    );
+    let missing = |o: &Outcome| o.missing.iter().sum::<usize>();
+    assert!(
+        missing(&o) < missing(&before),
+        "keyframe packets never received: {} (without the floor {})",
+        missing(&o),
+        missing(&before)
+    );
+    Ok(())
+}
+
+fn step(s: Settings) -> Result<Outcome, RtcError> {
+    slides(
+        s,
+        Bitrate::mbps(2),
+        Bitrate::kbps(60),
+        100_000,
+        Duration::from_secs(6),
+        Duration::from_secs(40),
+        Duration::from_secs(9),
+        Some((Duration::from_secs(10), Bitrate::kbps(500))),
+    )
+}
+
+/// The loss floor and the estimate window across the step (run with `--ignored --nocapture`).
+#[test]
+#[ignore]
+pub fn step_floor_compare() -> Result<(), RtcError> {
+    init_log();
+    init_crypto_default();
+    for loss in [false, true] {
+        for window in [3_000, 1_000] {
+            let s = Settings {
+                loss,
+                window: Duration::from_millis(window),
+                ..SFU
+            };
+            report("stepfloor", s, &step(s)?);
+        }
     }
     Ok(())
 }

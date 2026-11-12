@@ -171,6 +171,8 @@ impl Session {
             let mut bwe = Bwe::new(rate);
             bwe.set_wanted_probes(config.wanted_probes);
             bwe.set_delivery_floor(config.delivery_floor);
+            bwe.set_loss_floor(config.loss_floor);
+            bwe.set_estimate_window(config.estimate_window);
             (pacer, Some(bwe))
         } else {
             (PacerImpl::null(), None)

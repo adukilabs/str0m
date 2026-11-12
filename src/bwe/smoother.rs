@@ -3,8 +3,8 @@ use std::time::{Duration, Instant};
 
 use crate::rtp_::Bitrate;
 
-/// Time window for averaging estimate changes.
-const ESTIMATE_WINDOW: Duration = Duration::from_secs(3);
+/// Time window for averaging estimate changes (default; `RtcConfig::set_bwe_estimate_window`).
+pub(crate) const ESTIMATE_WINDOW: Duration = Duration::from_secs(3);
 
 type TimeBitrate = (Instant, Bitrate);
 
@@ -13,6 +13,7 @@ const TOLERANCE: f64 = 0.05;
 /// Smooths BWE estimates by averaging over a time window.
 pub struct EstimateSmoother {
     estimates: VecDeque<TimeBitrate>,
+    window: Duration,
     maybe_emit: bool,
     emitted: Option<Bitrate>,
 }
@@ -21,9 +22,15 @@ impl EstimateSmoother {
     pub fn new() -> Self {
         Self {
             estimates: VecDeque::new(),
+            window: ESTIMATE_WINDOW,
             maybe_emit: false,
             emitted: None,
         }
+    }
+
+    /// The window estimates are averaged over.
+    pub fn set_window(&mut self, window: Duration) {
+        self.window = window;
     }
 
     /// Record a new estimate and update the smoothed average.
@@ -38,7 +45,7 @@ impl EstimateSmoother {
 
         // Remove entries older than the window.
         while let Some((time, _)) = self.estimates.front() {
-            if now.duration_since(*time) > ESTIMATE_WINDOW {
+            if now.duration_since(*time) > self.window {
                 // Keep last entry
                 if self.estimates.len() == 1 {
                     break;
