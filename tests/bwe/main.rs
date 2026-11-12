@@ -13,3 +13,4 @@ mod loss;
 mod probes;
 mod recovery;
 mod simple;
+mod slides;

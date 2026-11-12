@@ -14,6 +14,7 @@
 //! and default constants, enabling compatible bandwidth discovery with WebRTC endpoints.
 
 use std::cmp::Ordering;
+use std::collections::VecDeque;
 use std::fmt;
 use std::time::{Duration, Instant};
 
@@ -96,6 +97,11 @@ impl Bwe {
         self.bwe.probe_control.set_wanted(enabled);
     }
 
+    /// Decrease to no less than 0.85x the delivery rate (`RtcConfig::set_bwe_delivery_floor`).
+    pub fn set_delivery_floor(&mut self, enabled: bool) {
+        self.bwe.delivery = enabled.then(DeliveryRate::default);
+    }
+
     pub fn update<'t>(
         &mut self,
         records: impl Iterator<Item = &'t crate::rtp_::TwccSendRecord>,
@@ -142,6 +148,8 @@ struct SendSideBandwidthEstimator {
     alr_detector: AlrDetector,
     link_capacity_estimator: LinkCapacityEstimator,
     last_updated_estimate: Option<Bitrate>,
+    /// The receiver's delivery rate, when a delay-based decrease is floored by it.
+    delivery: Option<DeliveryRate>,
 }
 
 impl SendSideBandwidthEstimator {
@@ -165,6 +173,7 @@ impl SendSideBandwidthEstimator {
             alr_detector,
             link_capacity_estimator: LinkCapacityEstimator::new(),
             last_updated_estimate: None,
+            delivery: None,
         }
     }
 
@@ -219,6 +228,11 @@ impl SendSideBandwidthEstimator {
             max_rtt = max_rtt.max(record.rtt());
         }
         acked_packets.sort_by(AckedPacket::order_by_receive_time);
+
+        if let Some(delivery) = self.delivery.as_mut() {
+            delivery.update(&acked_packets, now);
+            self.delay_controller.set_delivered(delivery.rate(now));
+        }
 
         for acked_packet in acked_packets.iter() {
             self.acked_bitrate_estimator
@@ -297,6 +311,9 @@ impl SendSideBandwidthEstimator {
         do_probe: bool,
         now: Instant,
     ) -> Option<ProbeClusterConfig> {
+        if let Some(delivery) = self.delivery.as_ref() {
+            self.delay_controller.set_delivered(delivery.rate(now));
+        }
         self.delay_controller
             .handle_timeout(self.acked_bitrate_estimator.current_estimate(), now);
 
@@ -497,5 +514,67 @@ impl fmt::Display for BandwidthUsage {
             BandwidthUsage::Normal => write!(f, "normal"),
             BandwidthUsage::Underuse => write!(f, "underuse"),
         }
+    }
+}
+
+/// Packets received over this long (remote clock) make a delivery rate.
+const DELIVERY_WINDOW: Duration = Duration::from_millis(250);
+/// A delivery rate needs packets received over at least this long: shorter spans are compressed by jitter.
+const DELIVERY_SPAN: Duration = Duration::from_millis(100);
+/// A delivery rate is used for this long after the feedback it came from.
+const DELIVERY_VALID: Duration = Duration::from_millis(500);
+
+/// The rate the receiver got packets at over the last [`DELIVERY_WINDOW`] of feedback: while the bottleneck queues it
+/// is the link's rate, otherwise at most it (`RtcConfig::set_bwe_delivery_floor`).
+#[derive(Debug, Default)]
+struct DeliveryRate {
+    /// Received packets, by remote receive time, oldest first.
+    received: VecDeque<(Instant, DataSize)>,
+    /// The rate from the last feedback that gave one, and when.
+    last: Option<(Bitrate, Instant)>,
+}
+
+impl DeliveryRate {
+    fn update(&mut self, acked: &[AckedPacket], now: Instant) {
+        for packet in acked {
+            if self
+                .received
+                .back()
+                .is_none_or(|(at, _)| *at <= packet.remote_recv_time)
+            {
+                self.received
+                    .push_back((packet.remote_recv_time, packet.size));
+            }
+        }
+        let Some(&(newest, _)) = self.received.back() else {
+            return;
+        };
+        while self
+            .received
+            .front()
+            .is_some_and(|(at, _)| newest.saturating_duration_since(*at) > DELIVERY_WINDOW)
+        {
+            self.received.pop_front();
+        }
+        let Some(&(oldest, _)) = self.received.front() else {
+            return;
+        };
+        let span = newest.saturating_duration_since(oldest);
+        if span < DELIVERY_SPAN {
+            return;
+        }
+        // the first packet's bytes arrived before the span started
+        let bytes = self
+            .received
+            .iter()
+            .skip(1)
+            .fold(DataSize::ZERO, |sum, (_, size)| sum + *size);
+        self.last = Some((bytes / span, now));
+    }
+
+    fn rate(&self, now: Instant) -> Option<Bitrate> {
+        self.last
+            .filter(|(_, at)| now.saturating_duration_since(*at) <= DELIVERY_VALID)
+            .map(|(rate, _)| rate)
     }
 }

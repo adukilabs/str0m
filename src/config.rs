@@ -67,6 +67,8 @@ pub(crate) struct BweConfig {
     pub(crate) pacer_queue_limit: Option<Duration>,
     /// Probe toward an unmet desired bitrate in any ALR or loss state.
     pub(crate) wanted_probes: bool,
+    /// A delay-based decrease goes no lower than 0.85x the rate the receiver got packets at lately.
+    pub(crate) delivery_floor: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -511,6 +513,22 @@ impl RtcConfig {
         self
     }
 
+    /// A delay-based decrease goes to 0.85x the rate the receiver got packets at lately (its delivery rate over the last
+    /// 250 ms of TWCC feedback), when that is above the acknowledged bitrate (default off, as WebRTC). Only relevant
+    /// with the BWE on ([`Self::enable_bwe()`], call that first).
+    ///
+    /// WebRTC decreases to 0.85x the acknowledged bitrate, a smoothed rate that trusts a sample far from it little. An
+    /// encoder sends steadily, so the two agree. A sender of bursts (an SFU forwarding a screen share: a slide change is
+    /// ten times the idle rate for a few hundred milliseconds) has an acknowledged bitrate near its idle rate, so the
+    /// first overuse of a burst cut the estimate to a fraction of the link. While the bottleneck queues, packets arrive
+    /// at the link's rate: that is what the decrease keeps.
+    pub fn set_bwe_delivery_floor(mut self, enabled: bool) -> Self {
+        if let Some(conf) = self.bwe_config.as_mut() {
+            conf.delivery_floor = enabled;
+        }
+        self
+    }
+
     /// The initial bitrate as set by [`Self::enable_bwe()`].
     ///
     /// ```
@@ -899,6 +917,7 @@ impl BweConfig {
             initial_bitrate,
             pacer_queue_limit: None,
             wanted_probes: false,
+            delivery_floor: false,
         }
     }
 }

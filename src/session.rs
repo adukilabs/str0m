@@ -170,6 +170,7 @@ impl Session {
             let pacer = PacerImpl::leaky_bucket(rate * 2.0, config.pacer_queue_limit);
             let mut bwe = Bwe::new(rate);
             bwe.set_wanted_probes(config.wanted_probes);
+            bwe.set_delivery_floor(config.delivery_floor);
             (pacer, Some(bwe))
         } else {
             (PacerImpl::null(), None)

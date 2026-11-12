@@ -45,6 +45,8 @@ pub struct RateControl {
     last_estimate_update: Option<Instant>,
     // Last RTT estimate in micro-seconds
     last_rtt: Option<Duration>,
+    /// The receiver's delivery rate lately, when a decrease is floored by it.
+    delivered: Option<Bitrate>,
 }
 
 impl RateControl {
@@ -62,7 +64,13 @@ impl RateControl {
             averaged_observed_bitrate: MovingAverage::new(OBSERVED_BIT_RATE_SMOOTHING_FACTOR),
             last_estimate_update: None,
             last_rtt: None,
+            delivered: None,
         }
+    }
+
+    /// The receiver's delivery rate lately (`RtcConfig::set_bwe_delivery_floor`).
+    pub fn set_delivered(&mut self, rate: Option<Bitrate>) {
+        self.delivered = rate;
     }
 
     /// Update with input from the delay controller.
@@ -247,7 +255,12 @@ impl RateControl {
 
     fn decrease(&mut self, observed_bitrate: Bitrate, now: Instant) {
         log_rate_control_applied_change!("decrease");
-        let mut new_estimate = observed_bitrate * BETA;
+        // a burst's delivery rate is the link's while it queues; the acknowledged bitrate of a bursty sender is its idle
+        // rate (`RtcConfig::set_bwe_delivery_floor`)
+        let base = self
+            .delivered
+            .map_or(observed_bitrate, |d| d.max(observed_bitrate));
+        let mut new_estimate = base * BETA;
 
         if self.estimated_bitrate < new_estimate {
             // Avoid increasing the bitrate on overuse

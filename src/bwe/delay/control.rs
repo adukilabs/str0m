@@ -134,6 +134,11 @@ impl DelayController {
         );
     }
 
+    /// The receiver's delivery rate lately: a decrease goes no lower than 0.85x it (`RtcConfig::set_bwe_delivery_floor`).
+    pub fn set_delivered(&mut self, rate: Option<Bitrate>) {
+        self.rate_control.set_delivered(rate);
+    }
+
     /// Get the latest estimate.
     pub fn last_estimate(&self) -> Option<Bitrate> {
         self.last_estimate
